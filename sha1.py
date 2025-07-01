@@ -18,24 +18,24 @@ m      = 0.1            # node mass
 k      = 1e3            # spring stiffness
 c      = 1e-4           # damping
 T_END  = 2.0            # max time for sampler
-EPOCHS = 200
-LR     = 1e-3
+EPOCHS = 199
+LR     = 2e-3
 
 # Sampling batch sizes
 B_PDE = 2000
-B_BC  = 200
-B_IC  = 200
+B_BC  = 5000
+B_IC  = 10000
 
 # Export paths
 CHECKPOINT = "cloth_pinn1.pth"
 DATAFILE   = "cloth_pinn_trajectories1.pt"
-GIF_NAME   = "cloth_simRU1.gif"
+GIF_NAME   = "cloth_simRU9.gif"
 
 # ───────────────────── ANNEALING CONFIG ──────────────────
-lambda_ic   = 10.0
-lambda_pin  = 10.0
-lambda_pde0 = 1e-10    # 前期 PDE 权重常量
-E_hold      = 100     # 持续小权重的 epoch 数
+lambda_ic   = 10000.0
+lambda_pin  = 10000.0
+lambda_pde0 = 1e-50    # 前期 PDE 权重常量
+E_hold      = 200     # 持续小权重的 epoch 数
 E_total     = EPOCHS  # =200
 alpha       = 1.0     # 幂次，可设 alpha=1 做线性，也可设 >1 做非线性
 # ─────────────────── INITIAL POSITIONS ────────────────────
@@ -108,19 +108,59 @@ model     = ClothPINN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
 # ─────────────────────── SAMPLERS ───────────────────────
-corner_idx = torch.tensor([0, N*(N-1)], device=device)
-def sampler(n):  # PDE collocation
-    idx = torch.randint(0, N*N, (n,), device=device)
-    return idx, pos0[idx], torch.rand(n,1,device=device)*T_END
+#corner_idx = torch.tensor([0, N-1, N*(N-1), N*N-1], device=device)
+fixed_idx = torch.arange(0, N, device=device)         # 0, 1, …, 19  共 N 个
+K = fixed_idx.numel()                                 # = 20
+# def sampler(n):  # PDE collocation
+#     idx = torch.randint(0, N*N, (n,), device=device)
+#     return idx, pos0[idx], torch.rand(n,1,device=device)*T_END
+def sampler(n):                                       # PDE collocation
+    idx_rand = torch.randint(0, N*N, (n,), device=device)
+    x_rand   = pos0[idx_rand]
+    t_rand   = torch.rand(n,1,device=device) * T_END
 
-def bcs(n):      # fixed corners
-    idx = corner_idx[torch.randint(0,2,(n,),device=device)]
-    return idx, pos0[idx], torch.rand(n,1,device=device)*T_END, torch.zeros(n,3,device=device)
+    # 拼上所有固定点，保证每个 epoch 都检查它们的 PDE 残差
+    t_fix = torch.rand(K,1,device=device) * T_END
+    idx   = torch.cat([fixed_idx, idx_rand])
+    x0    = torch.cat([pos0[fixed_idx], x_rand])
+    t0    = torch.cat([t_fix,         t_rand])
+    return idx, x0, t0
 
+# corner_idx = torch.tensor([0, N-1, N*(N-1), N*N-1], device=device)
+# K = corner_idx.numel()        # = 4
+
+def bcs(n):
+    idx = fixed_idx[torch.randint(0, K, (n,), device=device)]   # 四角都能抽到
+    x0  = pos0[idx]
+    t   = torch.rand(n, 1, device=device) * T_END
+
+    u0  = torch.zeros(n, 3, device=device)   # 位移目标
+    v0  = torch.zeros(n, 3, device=device)   # 速度目标
+    return idx, x0, t, u0, v0
+
+# def bcs(n):      # fixed corners
+#     idx = corner_idx[torch.randint(0,3,(n,),device=device)]
+#     return idx, pos0[idx], torch.rand(n,1,device=device)*T_END, torch.zeros(n,3,device=device)
+# def bcs(n=None):
+#     k = corner_idx.numel()         
+#     t  = torch.rand(k,1,device=device)*T_END
+#     u0 = torch.zeros(k,3,device=device)
+#     return corner_idx, pos0[corner_idx], t, u0
 def ics(n):      # zero disp & vel at t=0
     idx = torch.randint(0, N*N, (n,), device=device)
     t0  = torch.zeros(n,1,device=device, requires_grad=True)
     return idx, pos0[idx], t0, torch.zeros(n,3,device=device), torch.zeros(n,3,device=device)
+
+# Δt_ic = 0.05                        # 取 0–0.05 s 作为“初始时间带”
+
+# def ics():                          # ⬅️ 不再需要 n
+#     idx = torch.arange(N*N, device=device)          # 0…399
+#     t0  = torch.rand(idx.numel(), 1, device=device) * Δt_ic
+#     t0.requires_grad_()
+#     u0  = torch.zeros(idx.numel(), 3, device=device)
+#     v0  = torch.zeros_like(u0)
+#     return idx, pos0[idx], t0, u0, v0
+
 
 # ─────────────────────── RESIDUAL ────────────────────────
 def residual(idx_batch, x0_batch, t_batch):
@@ -142,7 +182,7 @@ def residual(idx_batch, x0_batch, t_batch):
             f_int[n] += compute_internal_force(p_i, p_j, L0)
 
     f_vis = -c * u_t
-    g     = torch.tensor([0.,0.,-9.8],device=device)
+    g     = torch.tensor([0.,0.,0.],device=device)
     f_g   = m * g.unsqueeze(0).expand_as(f_int)
 
     return m*u_tt - (f_int + f_vis + f_g)
@@ -162,25 +202,39 @@ for ep in range(1, EPOCHS+1):
     idx_p, x_p, t_p = sampler(B_PDE)
     loss_pde = (residual(idx_p, x_p, t_p)**2).mean()
 
-    _, x_bc, t_bc, u_bc = bcs(B_BC)
-    loss_bc = ((model(x_bc, t_bc) - u_bc)**2).mean()
+    _, x_bc, t_bc, u_bc, v_bc = bcs(B_BC)
+    t_bc.requires_grad_()                      # 保证能求时间导数
+    u_pred_bc = model(x_bc, t_bc)
+
+    u_t_bc = autograd.grad(
+        outputs=u_pred_bc,
+        inputs=t_bc,
+        grad_outputs=torch.ones_like(u_pred_bc),
+        create_graph=True
+    )[0]
+
+    loss_bc = ((u_pred_bc - u_bc)**2).mean()   # 位移项
+    loss_bc += ((u_t_bc  - v_bc)**2).mean()    # 速度项
+    #loss_bc = ((model(x_bc, t_bc) - u_bc)**2).mean()
 
     _, x_ic, t_ic, u_ic, v_ic = ics(B_IC)
     u_pred = model(x_ic, t_ic)
     u_t_ic = autograd.grad(u_pred, t_ic, grad_outputs=torch.ones_like(u_pred), create_graph=True)[0]
     loss_ic = ((u_pred - u_ic)**2).mean() + ((u_t_ic - v_ic)**2).mean()
 
-    #loss = loss_pde + loss_bc + loss_ic
-    loss = lambda_ic * loss_ic \
-         + lambda_pin * loss_bc \
-         + w_pde     * loss_pde
+    loss = loss_ic
+    #loss = lambda_ic * loss_ic \
+        #  + lambda_pin * loss_bc \
+        #  + w_pde     * loss_pde
+         
+
     loss.backward()
     optimizer.step()
 
     # if ep % 1 == 0 or ep==1:
     #     print(f"Epoch {ep}/{EPOCHS} → Lpde={loss_pde:.2e} Lbc={loss_bc:.2e} Lic={loss_ic:.2e}")
      # —— 日志 —— 
-    if ep == 1 or ep % 10 == 0:
+    if ep == 1 or ep % 1 == 0:
         print(f"Epoch {ep:3d}/{EPOCHS} | "
               f"w_pde={w_pde:.2e} | "
               f"Lpde={loss_pde:.2e}  Lbc={loss_bc:.2e}  Lic={loss_ic:.2e}")
@@ -190,7 +244,7 @@ for ep in range(1, EPOCHS+1):
 torch.save(model.state_dict(), CHECKPOINT)
 
 # Generate full trajectory at NT timesteps
-NT   = 100
+NT   = 1
 t_eval = torch.linspace(0, T_END, NT, device=device).unsqueeze(1)
 with torch.no_grad():
     pos_pred = []
@@ -227,7 +281,7 @@ springs = np.array(springs)
 fig = plt.figure(figsize=(6,6))
 ax  = fig.add_subplot(111, projection='3d')
 ax.set_box_aspect((1,1,1))
-ax.view_init(elev=30, azim=180)
+ax.view_init(elev=30, azim=90)
 
 # Set consistent axes limits from first frame
 xyz0 = pos_pred[0]
